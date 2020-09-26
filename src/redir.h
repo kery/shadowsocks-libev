@@ -22,6 +22,8 @@
 #ifndef _REDIR_H
 #define _REDIR_H
 
+#include <libcork/ds.h>
+
 #ifdef HAVE_LIBEV_EV_H
 #include <libev/ev.h>
 #else
@@ -60,6 +62,8 @@ typedef struct server {
 
     struct sockaddr_storage destaddr;
     ev_timer delayed_connect_watcher;
+
+    struct cork_dllist_item entries;
 } server_t;
 
 typedef struct remote_ctx {

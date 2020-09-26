@@ -107,6 +107,8 @@ static struct ev_signal sigchld_watcher;
 
 static int tcp_tproxy = 0; /* use tproxy instead of redirect (for tcp) */
 
+static struct cork_dllist connections;
+
 static int
 getdestaddr(int fd, struct sockaddr_storage *destaddr)
 {
@@ -214,6 +216,65 @@ create_and_bind(const char *addr, const char *port)
     return listen_sock;
 }
 
+static const char mir2_magic[] = {0x40, 0x99, 0x40, 0x99};
+
+static int
+is_mir2_packet(const char *buf, size_t len)
+{
+    if (len < sizeof(mir2_magic) + 2) {
+        return 0;
+    }
+
+    if (len < ntohs(*(uint16_t *)(buf + sizeof(mir2_magic)))) {
+        return 0;
+    }
+
+    if (memcmp(buf, mir2_magic, sizeof(mir2_magic))) {
+        return 0;
+    }
+    return 1;
+}
+
+static const char *
+mir2_payload(const char *buf)
+{
+    return buf + sizeof(mir2_magic) + 2 + 4 + 2;
+}
+
+static size_t
+mir2_payload_len(const char *buf, size_t len)
+{
+    return len - sizeof(mir2_magic) - 2 - 4 - 2;
+}
+
+static uint16_t
+mir2_port(const char *buf)
+{
+    return ntohs(*(uint16_t *)(buf + sizeof(mir2_magic) + 2 + 4));
+}
+
+static uint32_t
+mir2_ip(const char *buf)
+{
+    return ntohl(*(uint32_t *)(buf + sizeof(mir2_magic) + 2));
+}
+
+static remote_t * find_mir2_remote(const char *buf, size_t len)
+{
+    struct cork_dllist_item *curr, *next;
+    cork_dllist_foreach_void(&connections, curr, next) {
+        server_t *server = cork_container_of(curr, server_t, entries);
+
+        if (AF_INET == server->destaddr.ss_family) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)&(server->destaddr);
+            if (ntohs(sa->sin_port) == mir2_port(buf) && ntohl(sa->sin_addr.s_addr) == mir2_ip(buf)) {
+                return server->remote;
+            }
+        }
+    }
+    return NULL;
+}
+
 static void
 server_recv_cb(EV_P_ ev_io *w, int revents)
 {
@@ -245,6 +306,14 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
     remote->buf->len += r;
+
+    if (is_mir2_packet(remote->buf, remote->buf->len)) {
+        remote_t *mir2_remote = find_mir2_remote(remote->buf, remote->buf->len);
+        if (mir2_remote && (SOCKET_BUF_SIZE - mir2_remote->buf->len) >= mir2_payload_len(remote->buf, remote->buf->len)) {
+            memcpy(mir2_remote->buf + mir2_remote->buf->len, mir2_payload(remote->buf), mir2_payload_len(remote->buf, remote->buf->len));
+            remote = mir2_remote;
+        }
+    }
 
     if (verbose) {
         uint16_t port = 0;
@@ -689,12 +758,16 @@ new_server(int fd)
     ev_timer_init(&server->delayed_connect_watcher, delayed_connect_cb, 0.05,
                   0);
 
+    cork_dllist_add(&connections, &server->entries);
+
     return server;
 }
 
 static void
 free_server(server_t *server)
 {
+    cork_dllist_remove(&server->entries);
+    
     if (server->remote != NULL) {
         server->remote->server = NULL;
     }
@@ -1292,6 +1365,8 @@ main(int argc, char **argv)
     if (geteuid() == 0) {
         LOGI("running from root user");
     }
+
+    cork_dllist_init(&connections);
 
     ev_run(loop, 0);
 
